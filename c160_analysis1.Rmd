@@ -1,0 +1,924 @@
+---
+title: "STATS C160 Final Project: Obesity Paradox in the ICU — Effect Heterogeneity"
+author: "Allen Yamin"
+date: "2026-03-05"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    code_folding: hide
+  pdf_document:
+    toc: true
+---
+
+```{r setup, include=FALSE, cache=FALSE}
+# ── Packages ─────────────────────────────────────────────────────────────────
+pkgs <- c("ricu", "data.table", "xgboost", "grf", "ggplot2", "fst",
+          "knitr", "kableExtra", "DiagrammeR")
+new_pkgs <- pkgs[!sapply(pkgs, requireNamespace, quietly = TRUE)]
+if (length(new_pkgs)) install.packages(new_pkgs, repos = "https://cloud.r-project.org")
+
+library(ricu)
+library(data.table)
+library(xgboost)
+library(grf)
+library(ggplot2)
+library(fst)
+library(knitr)
+library(kableExtra)
+
+# ── Global settings ──────────────────────────────────────────────────────────
+Sys.setenv(RICU_DATA_PATH = "C:/Users/allen/Desktop/Stats C160")
+attach_src("miiv", assign_env = .GlobalEnv)
+set.seed(42)
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  cache      = TRUE,
+  cache.lazy = FALSE
+)
+
+# ── Source & variable names (vignette convention) ────────────────────────────
+src <- "miiv"
+X   <- "X_bmi"         # treatment: BMI > 25
+Y   <- "Y_death"       # outcome: in-hospital mortality
+Z   <- c("Z_age", "Z_sex", "Z_charlson")   # adjustment set
+
+# ── Helper: clamp propensity scores ──────────────────────────────────────────
+clip01 <- function(x) pmax(pmin(x, 0.99), 0.01)
+
+# ── Helper: xgboost with 5-fold CV ──────────────────────────────────────────
+cv_xgb <- function(d, y_var, x_vars, nfolds = 5) {
+  # +0.0 forces fresh 64-byte-aligned allocation (xgboost >= 2.x requirement)
+  Y_vec <- d[[y_var]] + 0.0
+  X_mat <- matrix(0.0, nrow = nrow(d), ncol = length(x_vars))
+  for (j in seq_along(x_vars)) X_mat[, j] <- d[[x_vars[j]]] + 0.0
+  dtrain <- xgb.DMatrix(X_mat, label = Y_vec)
+
+  params <- list(objective = "binary:logistic", max_depth = 4, eta = 0.05,
+                 subsample = 0.8, colsample_bytree = 0.8,
+                 eval_metric = "logloss", nthread = parallel::detectCores() - 1)
+
+  cv_res <- suppressMessages(xgb.cv(
+    params = params, data = dtrain, nrounds = 500,
+    nfold = nfolds, early_stopping_rounds = 20, verbose = 0
+  ))
+  best_nr <- cv_res$best_iteration
+  if (is.null(best_nr) || best_nr < 1) best_nr <- 50
+  xgb.train(params = params, data = dtrain, nrounds = best_nr, verbose = 0)
+}
+
+# ── Helper: predict from xgboost with optional do-intervention ───────────────
+pred_xgb <- function(mod, df_feat, do_x = NULL, X_var = NULL) {
+  df <- copy(df_feat)
+  if (!is.null(do_x) && !is.null(X_var) && X_var %in% names(df))
+    df[, (X_var) := do_x]
+  X_test <- matrix(0.0, nrow = nrow(df), ncol = ncol(df))
+  for (j in seq_len(ncol(df))) X_test[, j] <- df[[j]] + 0.0
+  dtest <- xgb.DMatrix(X_test)
+  as.numeric(predict(mod, dtest))
+}
+
+# ── Helper: cross-fitted AIPW (DML) ─────────────────────────────────────────
+# Returns list(ate, sd, sc)  — matches Vignette I cf_aipw
+cf_aipw <- function(d, X, Y, Z, K = 5) {
+  n     <- nrow(d)
+  folds <- sample(rep(seq_len(K), length.out = n))
+  scores <- numeric(n)
+
+  feat_mu <- c(Z, X)
+  feat_pi <- Z
+
+  for (k in seq_len(K)) {
+    is_test <- (folds == k)
+    d_tr <- d[!is_test]; d_te <- d[is_test]
+
+    mu_mod <- cv_xgb(d_tr, Y, feat_mu)
+    mu1 <- pred_xgb(mu_mod, d_te[, feat_mu, with = FALSE], do_x = 1L, X_var = X)
+    mu0 <- pred_xgb(mu_mod, d_te[, feat_mu, with = FALSE], do_x = 0L, X_var = X)
+
+    pi_mod <- cv_xgb(d_tr, X, feat_pi)
+    pi_hat <- clip01(pred_xgb(pi_mod, d_te[, feat_pi, with = FALSE]))
+
+    W_te <- as.numeric(d_te[[X]])
+    Y_te <- as.numeric(d_te[[Y]])
+
+    scores[is_test] <- (mu1 - mu0
+      + W_te / pi_hat * (Y_te - mu1)
+      - (1 - W_te) / (1 - pi_hat) * (Y_te - mu0))
+  }
+  list(ate = mean(scores), sd = sd(scores) / sqrt(n), sc = scores)
+}
+
+# ── Helper: E-value (VanderWeele & Ding 2017) ───────────────────────────────
+evalue_fn <- function(rr) {
+  if (is.na(rr) || rr <= 0) return(NA_real_)
+  if (rr >= 1) rr + sqrt(rr * (rr - 1))
+  else         1 / rr + sqrt((1 / rr) * (1 / rr - 1))
+}
+rd_to_rr <- function(rd, p0) {
+  if (p0 <= 0 || p0 >= 1) return(NA_real_)
+  (p0 + rd) / p0
+}
+
+# ── Helper: z-TE summary row ────────────────────────────────────────────────
+zte_row <- function(res, label) {
+  data.frame(estimand = label, est = res$ate, se = res$sd,
+             lo = res$ate - 1.96 * res$sd, hi = res$ate + 1.96 * res$sd,
+             pval = 2 * pnorm(-abs(res$ate / res$sd)),
+             stringsAsFactors = FALSE)
+}
+```
+
+# Section 0 — Data Loading
+
+```{r load-data, cache=TRUE, cache.extra=file.info("C:/Users/allen/Desktop/Stats C160/miiv/admissions.fst")$mtime}
+# ── Raw fst reader ───────────────────────────────────────────────────────────
+ricu_path <- Sys.getenv("RICU_DATA_PATH")
+miiv_path <- file.path(ricu_path, "miiv")
+read_miiv <- function(tbl) {
+  path <- file.path(miiv_path, paste0(tbl, ".fst"))
+  if (!file.exists(path)) stop(sprintf("Table not found: %s", path))
+  read_fst(path, as.data.table = TRUE)
+}
+
+# ── 1. BMI from omr ─────────────────────────────────────────────────────────
+omr     <- read_miiv("omr")
+bmi_raw <- omr[result_name %in% c("BMI (kg/m2)", "BMI")]
+bmi_raw[, bmi := suppressWarnings(as.numeric(result_value))]
+bmi_raw <- bmi_raw[!is.na(bmi) & bmi > 10 & bmi < 80]
+setorder(bmi_raw, subject_id, -chartdate)
+bmi_dat <- bmi_raw[, .SD[1], by = subject_id][, .(subject_id, bmi)]
+bmi_dat <- bmi_dat[bmi > 18.5 & bmi < 35]
+bmi_dat[, X_bmi := as.integer(bmi > 25)]
+cat(sprintf("Patients with valid BMI (18.5-35): %d\n", nrow(bmi_dat)))
+cat(sprintf("  Obese (BMI>25): %d (%.1f%%)\n", sum(bmi_dat$X_bmi), 100*mean(bmi_dat$X_bmi)))
+
+# ── 2. First ICU stay per patient ────────────────────────────────────────────
+icu <- read_miiv("icustays")
+setorder(icu, subject_id, intime)
+icu_first <- icu[, .SD[1], by = subject_id][, .(subject_id, stay_id, hadm_id)]
+cat(sprintf("Unique first ICU admissions: %d\n", nrow(icu_first)))
+
+# ── 3. Demographics ─────────────────────────────────────────────────────────
+pat <- read_miiv("patients")[, .(subject_id, gender, anchor_age)]
+pat[, Z_sex := as.integer(gender == "M")]
+pat[, Z_age := as.numeric(anchor_age)]
+pat[, c("gender", "anchor_age") := NULL]
+
+# ── 4. Charlson comorbidity ─────────────────────────────────────────────────
+# Note: ricu's "charlson" concept may return ICD-code counts rather than a
+# validated Charlson index. We treat this as a comorbidity-burden proxy.
+charlson_dat <- tryCatch({
+  cc <- as.data.table(load_concepts("charlson", "miiv", verbose = FALSE))
+  idx <- index_var(cc); if (!is.null(idx)) cc[, (idx) := NULL]
+  cc <- cc[, .(subject_id = get(id_vars(cc)[1]), Z_charlson = charlson)]
+  cc[, .SD[1], by = subject_id]
+}, error = function(e) {
+  cat("charlson unavailable via ricu; using ICD-code count proxy\n")
+  diag_tbl <- read_miiv("diagnoses_icd")
+  diag_tbl <- merge(diag_tbl, icu_first[, .(subject_id, hadm_id)],
+                    by = c("subject_id", "hadm_id"))
+  diag_tbl[, .(Z_charlson = .N), by = subject_id]
+})
+
+# ── 5. Mortality & admission type ───────────────────────────────────────────
+adm_raw  <- read_miiv("admissions")
+mort_dat <- adm_raw[, .(subject_id, hadm_id,
+                         Y_death = as.integer(hospital_expire_flag),
+                         admission_type)]
+mort_dat <- merge(mort_dat, icu_first[, .(subject_id, hadm_id)],
+                  by = c("subject_id", "hadm_id"))
+mort_dat[, adm_type := fcase(
+  grepl("SURGICAL", admission_type, ignore.case = TRUE), "surgical",
+  admission_type %in% c("EW EMER.","EU OBSERVATION","URGENT",
+                         "DIRECT EMER.","OBSERVATION ADMIT","EMERGENCY"), "medical",
+  default = "other"
+)]
+cat("\n=== admission_type distribution ===\n")
+print(sort(table(mort_dat$admission_type), decreasing = TRUE))
+cat("\n=== adm_type classification ===\n")
+print(table(mort_dat$adm_type, useNA = "always"))
+
+# ── 5.5 SOFA score via ricu concept ──────────────────────────────────────────
+sofa_dat <- tryCatch({
+  sf <- load_concepts("sofa", "miiv",
+                       explicit_wins = hours(12L), verbose = FALSE)
+  sf <- as.data.table(sf)
+  idx <- index_var(sf)
+  if (!is.null(idx)) sf[, (idx) := NULL]
+  id_col_name <- id_vars(sf)[1]
+  sf <- sf[, .(subject_id = get(id_col_name), Z_sofa = sofa)]
+  sf[, .SD[1], by = subject_id]
+}, error = function(e) {
+  cat("sofa concept unavailable via ricu; setting Z_sofa = NA\n")
+  data.table(subject_id = integer(0), Z_sofa = numeric(0))
+})
+cat(sprintf("SOFA scores extracted: %d patients\n", nrow(sofa_dat)))
+if (nrow(sofa_dat) > 0) {
+  cat(sprintf("SOFA range: [%.0f, %.0f], median: %.0f\n",
+              min(sofa_dat$Z_sofa, na.rm = TRUE),
+              max(sofa_dat$Z_sofa, na.rm = TRUE),
+              median(sofa_dat$Z_sofa, na.rm = TRUE)))
+}
+
+# ── 6. Merge ────────────────────────────────────────────────────────────────
+# Inner joins for BMI × ICU × mortality to avoid survivorship bias
+dat <- merge(bmi_dat, icu_first[, .(subject_id, hadm_id)], by = "subject_id")
+dat <- merge(dat, pat, by = "subject_id")
+dat <- merge(dat, mort_dat[, .(subject_id, Y_death, adm_type)], by = "subject_id")
+dat <- merge(dat, charlson_dat, by = "subject_id", all.x = TRUE)
+dat[is.na(Z_charlson), Z_charlson := 0]
+if (nrow(sofa_dat) > 0) {
+  dat <- merge(dat, sofa_dat, by = "subject_id", all.x = TRUE)
+} else {
+  dat[, Z_sofa := NA_real_]
+}
+dat[is.na(Z_sofa), Z_sofa := 0]
+stopifnot(!anyNA(dat$Y_death), !anyNA(dat$X_bmi))
+
+# Factor encoding for admission type
+dat[, adm_type := factor(adm_type, levels = c("medical", "surgical", "other"))]
+dat[, adm_type_num := as.integer(adm_type) - 1L]
+
+# Drop meta columns
+meta_drop <- intersect(c("hadm_id", "bmi"), names(dat))
+if (length(meta_drop)) dat[, (meta_drop) := NULL]
+
+# Primary analysis: medical + surgical only
+dat_main <- dat[adm_type %in% c("medical", "surgical")]
+dat_main[, adm_type := droplevels(adm_type)]
+
+# ── Sanity checks ────────────────────────────────────────────────────────────
+stopifnot(all(c(X, Y, Z) %in% names(dat_main)))
+stopifnot(nrow(dat_main) > 100)
+
+cat(sprintf("\n── Final cohort ────────────────────────────────────\n"))
+cat(sprintf("N = %d  |  medical: %d  |  surgical: %d\n",
+            nrow(dat_main),
+            sum(dat_main$adm_type == "medical"),
+            sum(dat_main$adm_type == "surgical")))
+cat(sprintf("Mortality: %.3f  |  Obese: %.3f\n",
+            mean(dat_main$Y_death), mean(dat_main$X_bmi)))
+cat(sprintf("Female: %d  |  Male: %d\n",
+            sum(dat_main$Z_sex == 0), sum(dat_main$Z_sex == 1)))
+cat(sprintf("SOFA: median=%.0f, non-zero=%d (%.1f%%)\n",
+            median(dat_main$Z_sofa),
+            sum(dat_main$Z_sofa > 0),
+            100 * mean(dat_main$Z_sofa > 0)))
+print(dat_main[, .(mortality = round(mean(Y_death), 3), n = .N),
+               by = .(X_bmi, adm_type)])
+```
+
+# Section 1 — Background, Estimands, DAG, Identification
+
+```{r estimands-table, cache=FALSE}
+# ── Formal estimands (risk-difference scale) ─────────────────────────────────
+estimands <- data.frame(
+  Symbol = c("TE (ATE)", "ETT", "z-TE(female)", "z-TE(male)",
+             "z-TE(medical)", "z-TE(surgical)"),
+  Definition = c(
+    "E[Y(1) - Y(0)]  — average treatment effect over full cohort",
+    "E[Y(1) - Y(0) | X=1]  — effect among the treated (obese)",
+    "E[Y(1) - Y(0) | Z_sex=0]  — effect among females",
+    "E[Y(1) - Y(0) | Z_sex=1]  — effect among males",
+    "E[Y(1) - Y(0) | AdmType=medical]",
+    "E[Y(1) - Y(0) | AdmType=surgical]"
+  ),
+  stringsAsFactors = FALSE
+)
+kable(estimands, caption = "Formal estimands (all risk differences)") |>
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r dag, cache=FALSE}
+# ── DAG ──────────────────────────────────────────────────────────────────────
+# Adjustment set Z = {Age, Sex, Charlson} blocks all backdoor paths BMI → Death.
+# SOFA is a mediator (BMI → SOFA → Death) — excluded to estimate total effect.
+# Sex and AdmType are pre-treatment variables examined primarily as effect modifiers.
+# Sex is included in Z; AdmType is not in the adjustment set because it is
+# analyzed as a subgroup-defining variable. A variable can serve both roles;
+# we focus on the effect-modification interpretation here.
+DiagrammeR::grViz('
+  digraph dag {
+    rankdir = LR
+    graph [fontname = "Helvetica"]
+    node  [shape = plaintext, fontsize = 11, fontname = "Helvetica"]
+    edge  [fontsize = 9]
+
+    U [label = "U (unmeasured)", style = dashed, color = gray60, fontcolor = gray60]
+
+    Age     -> Charlson
+    Age     -> BMI
+    Age     -> Death
+    Age     -> AdmType
+    Sex     -> BMI
+    Sex     -> Charlson
+    Sex     -> Death
+    Charlson -> BMI
+    Charlson -> Death
+    U -> Charlson [style = dashed, color = gray60]
+    U -> BMI      [style = dashed, color = gray60]
+
+    BMI  -> Death
+
+    AdmType -> Death
+
+    { rank = same; BMI }
+  }
+')
+```
+
+```{r identification, cache=FALSE}
+# ── Identification ───────────────────────────────────────────────────────────
+# Backdoor criterion: Z = {Age, Sex, Charlson} blocks all non-causal paths.
+# Positivity: P(X=1|Z=z) bounded away from 0 and 1 for all z (verified below).
+# Consistency: BMI>25 is well-defined binary treatment.
+# No interference: one patient's BMI does not affect another's mortality.
+# SOFA (illness severity): extracted via ricu but excluded from the adjustment
+# set Z because it is a mediator on the BMI → SOFA → Death path. Including it
+# would estimate a controlled direct effect rather than the total effect.
+# SOFA is retained in the dataset for potential exploratory stratification.
+# Charlson note: ricu may return ICD-code count rather than validated index.
+# Admission type affects Death but is not included in the core adjustment set Z.
+# Instead, it is used to define subgroups for secondary heterogeneity analysis.
+# Sensitivity to this choice could be checked by including AdmType in nuisance models.
+
+cat("Adjustment set Z:", paste(Z, collapse = ", "), "\n")
+cat("Treatment X:", X, "\n")
+cat("Outcome Y:", Y, "\n")
+```
+
+```{r positivity-check, cache=TRUE, dependson="load-data"}
+# ── Positivity check: propensity score overlap ───────────────────────────────
+ps_mod <- glm(X_bmi ~ Z_age + Z_sex + Z_charlson, data = dat_main, family = binomial())
+dat_main[, ps := predict(ps_mod, type = "response")]
+
+dat_main[, sex_label := factor(Z_sex, levels = c(0, 1), labels = c("Female", "Male"))]
+
+ggplot(dat_main, aes(x = ps, fill = factor(X_bmi), color = factor(X_bmi))) +
+  geom_density(alpha = 0.35, linewidth = 0.7) +
+  facet_wrap(~ sex_label, ncol = 2) +
+  scale_fill_manual(values = c("#4C8EC8","#E86B2E"),
+                    labels = c("Non-obese","Obese (BMI>25)")) +
+  scale_color_manual(values = c("#4C8EC8","#E86B2E"),
+                     labels = c("Non-obese","Obese (BMI>25)")) +
+  labs(x = "P(BMI>25 | Age, Sex, Charlson)", y = "Density",
+       fill = NULL, color = NULL,
+       title = "Propensity Score Overlap by Sex") +
+  theme_bw(base_size = 12) + theme(legend.position = "bottom")
+
+cat(sprintf("Propensity score range: [%.4f, %.4f]\n", min(dat_main$ps), max(dat_main$ps)))
+cat(sprintf("Proportion with ps < 0.05: %.2f%%\n", 100 * mean(dat_main$ps < 0.05)))
+cat(sprintf("Proportion with ps > 0.95: %.2f%%\n", 100 * mean(dat_main$ps > 0.95)))
+```
+
+# Section 2 — TV Measure (Naive Association)
+
+We begin with the unadjusted association (TV) as a baseline. This quantity captures the raw mortality difference between obese and non-obese patients without adjusting for confounders, and will serve as a reference point for the causal estimators that follow.
+
+```{r tv-measure, cache=TRUE, dependson="load-data"}
+# ── TV = Total Variation = naive (unadjusted) association ────────────────────
+# TV = E[Y|X=1] - E[Y|X=0]  (no adjustment for confounders)
+
+tv_overall <- mean(dat_main$Y_death[dat_main$X_bmi == 1]) -
+              mean(dat_main$Y_death[dat_main$X_bmi == 0])
+
+# Bootstrap CI for TV (500 iterations, reflection method — vignette pattern)
+set.seed(42)
+B <- 200
+tv_boot <- numeric(B)
+n <- nrow(dat_main)
+for (b in seq_len(B)) {
+  idx <- sample(n, n, replace = TRUE)
+  d_b <- dat_main[idx]
+  tv_boot[b] <- mean(d_b$Y_death[d_b$X_bmi == 1]) -
+                mean(d_b$Y_death[d_b$X_bmi == 0])
+}
+# Reflection CI (vignette pattern)
+tv_ci <- c(2 * tv_overall - quantile(tv_boot, 0.975),
+           2 * tv_overall - quantile(tv_boot, 0.025))
+
+cat(round(tv_overall, 3), "[", round(tv_ci[1], 3), ",", round(tv_ci[2], 3), "]\n")
+```
+
+# Section 3 — Estimation Ladder (IPW, Outcome Regression, AIPW, DML)
+
+We now estimate the ATE using four progressively more robust approaches: IPW (weighting only), outcome regression (modeling only), AIPW (doubly robust), and DML (cross-fitted AIPW). Agreement across estimators strengthens confidence in the causal estimate.
+
+## 3A — IPW Estimator
+
+```{r ipw, cache=TRUE, dependson="load-data"}
+# ── IPW (Inverse Probability Weighting) ──────────────────────────────────────
+# Propensity model: logistic regression P(X=1 | Z)
+set.seed(42)
+ps_ipw <- glm(as.formula(paste(X, "~", paste(Z, collapse = "+"))),
+              data = dat_main, family = binomial())
+dat_main[, pi_hat := clip01(predict(ps_ipw, type = "response"))]
+
+# IPW ATE point estimate
+ipw_ate <- with(dat_main,
+  mean(X_bmi * Y_death / pi_hat) - mean((1 - X_bmi) * Y_death / (1 - pi_hat))
+)
+
+# Bootstrap CI (500 iterations, reflection method)
+set.seed(42)
+B <- 200
+ipw_boot <- numeric(B)
+n <- nrow(dat_main)
+for (b in seq_len(B)) {
+  idx <- sample(n, n, replace = TRUE)
+  d_b <- dat_main[idx]
+  ps_b <- glm(as.formula(paste(X, "~", paste(Z, collapse = "+"))),
+              data = d_b, family = binomial())
+  pi_b <- clip01(predict(ps_b, type = "response"))
+  ipw_boot[b] <- mean(d_b$X_bmi * d_b$Y_death / pi_b) -
+                 mean((1 - d_b$X_bmi) * d_b$Y_death / (1 - pi_b))
+}
+ipw_ci <- c(2 * ipw_ate - quantile(ipw_boot, 0.975),
+            2 * ipw_ate - quantile(ipw_boot, 0.025))
+
+cat("IPW ATE:", round(ipw_ate, 3), "[", round(ipw_ci[1], 3), ",", round(ipw_ci[2], 3), "]\n")
+```
+
+## 3B — Outcome Regression (GLM)
+
+```{r or-glm, cache=TRUE, dependson="load-data"}
+# ── Outcome regression: logistic GLM ─────────────────────────────────────────
+set.seed(42)
+feat_mu <- c(Z, X)
+glm_mu <- glm(as.formula(paste(Y, "~", paste(feat_mu, collapse = "+"))),
+              data = dat_main, family = binomial())
+d1 <- copy(dat_main); d1[, (X) := 1L]
+d0 <- copy(dat_main); d0[, (X) := 0L]
+mu1_glm <- predict(glm_mu, newdata = d1, type = "response")
+mu0_glm <- predict(glm_mu, newdata = d0, type = "response")
+or_glm_ate <- mean(mu1_glm - mu0_glm)
+
+# Bootstrap CI
+set.seed(42)
+B <- 200
+or_glm_boot <- numeric(B)
+n <- nrow(dat_main)
+for (b in seq_len(B)) {
+  idx <- sample(n, n, replace = TRUE)
+  d_b <- dat_main[idx]
+  mod_b <- glm(as.formula(paste(Y, "~", paste(feat_mu, collapse = "+"))),
+               data = d_b, family = binomial())
+  d1b <- copy(d_b); d1b[, (X) := 1L]
+  d0b <- copy(d_b); d0b[, (X) := 0L]
+  or_glm_boot[b] <- mean(predict(mod_b, newdata = d1b, type = "response") -
+                          predict(mod_b, newdata = d0b, type = "response"))
+}
+or_glm_ci <- c(2 * or_glm_ate - quantile(or_glm_boot, 0.975),
+               2 * or_glm_ate - quantile(or_glm_boot, 0.025))
+
+cat("OR(GLM) ATE:", round(or_glm_ate, 3), "[",
+    round(or_glm_ci[1], 3), ",", round(or_glm_ci[2], 3), "]\n")
+```
+
+## 3C — AIPW (Doubly Robust)
+
+```{r aipw, cache=TRUE, dependson="load-data"}
+# ── AIPW: combines IPW + outcome regression ──────────────────────────────────
+# Single-fold (no cross-fitting) doubly-robust estimator
+set.seed(42)
+
+# Propensity scores from IPW section
+pi_aipw <- dat_main$pi_hat
+
+# Fit XGBoost outcome model for AIPW nuisance estimates
+feat_mu <- c(Z, X)
+mu_aipw_mod <- cv_xgb(dat_main, Y, feat_mu)
+mu1_aipw <- pred_xgb(mu_aipw_mod, dat_main[, feat_mu, with = FALSE], do_x = 1L, X_var = X)
+mu0_aipw <- pred_xgb(mu_aipw_mod, dat_main[, feat_mu, with = FALSE], do_x = 0L, X_var = X)
+
+aipw_scores <- with(dat_main, {
+  (mu1_aipw - mu0_aipw) +
+    X_bmi / pi_aipw * (Y_death - mu1_aipw) -
+    (1 - X_bmi) / (1 - pi_aipw) * (Y_death - mu0_aipw)
+})
+aipw_ate <- mean(aipw_scores)
+
+# Bootstrap CI
+set.seed(42)
+B <- 200
+aipw_boot <- numeric(B)
+n <- nrow(dat_main)
+for (b in seq_len(B)) {
+  idx <- sample(n, n, replace = TRUE)
+  d_b <- dat_main[idx]
+  # propensity
+  ps_b  <- glm(as.formula(paste(X, "~", paste(Z, collapse = "+"))),
+               data = d_b, family = binomial())
+  pi_b  <- clip01(predict(ps_b, type = "response"))
+  # outcome
+  mu_b  <- cv_xgb(d_b, Y, feat_mu)
+  m1_b  <- pred_xgb(mu_b, d_b[, feat_mu, with = FALSE], do_x = 1L, X_var = X)
+  m0_b  <- pred_xgb(mu_b, d_b[, feat_mu, with = FALSE], do_x = 0L, X_var = X)
+  sc_b  <- (m1_b - m0_b) +
+            d_b$X_bmi / pi_b * (d_b$Y_death - m1_b) -
+            (1 - d_b$X_bmi) / (1 - pi_b) * (d_b$Y_death - m0_b)
+  aipw_boot[b] <- mean(sc_b)
+}
+aipw_ci <- c(2 * aipw_ate - quantile(aipw_boot, 0.975),
+             2 * aipw_ate - quantile(aipw_boot, 0.025))
+
+cat("AIPW ATE:", round(aipw_ate, 3), "[",
+    round(aipw_ci[1], 3), ",", round(aipw_ci[2], 3), "]\n")
+```
+
+## 3D — DML (Cross-Fitted AIPW)
+
+```{r dml, cache=TRUE, dependson="load-data"}
+# ── DML = cross-fitted AIPW (K=5) ───────────────────────────────────────────
+# Uses cf_aipw() helper which does K-fold cross-fitting with xgboost nuisance.
+# CLT-based CI (no bootstrap needed — vignette pattern for DML).
+set.seed(42)
+dml_res <- cf_aipw(dat_main, X, Y, Z, K = 5)
+dml_ci  <- c(dml_res$ate - 1.96 * dml_res$sd,
+             dml_res$ate + 1.96 * dml_res$sd)
+
+cat("DML ATE:", round(dml_res$ate, 3), "[",
+    round(dml_ci[1], 3), ",", round(dml_ci[2], 3), "]\n")
+```
+
+## 3E — Estimation Summary Table
+
+```{r estimation-summary, cache=FALSE, dependson=c("tv-measure","ipw","or-glm","aipw","dml")}
+# ── Summary table: all estimators ────────────────────────────────────────────
+est_tbl <- data.frame(
+  Estimator = c("TV (naive)", "IPW", "OR (GLM)", "AIPW", "DML (CF-AIPW)"),
+  ATE       = round(c(tv_overall, ipw_ate, or_glm_ate, aipw_ate, dml_res$ate), 4),
+  CI_low    = round(c(tv_ci[1], ipw_ci[1], or_glm_ci[1], aipw_ci[1], dml_ci[1]), 4),
+  CI_high   = round(c(tv_ci[2], ipw_ci[2], or_glm_ci[2], aipw_ci[2], dml_ci[2]), 4),
+  stringsAsFactors = FALSE
+)
+kable(est_tbl, caption = "ATE estimates across all estimators (risk difference)") |>
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+# Section 4 — Effect Heterogeneity
+
+Our primary research question is whether the obesity paradox differs by sex. We examine sex as the primary effect modifier and admission type as a secondary dimension, using stratified CF-AIPW estimates (z-TE) with Wald tests for effect modification.
+
+## 4A — z-TE by Sex (PRIMARY)
+
+```{r zte-sex, cache=TRUE, dependson="load-data"}
+# ── z-TE by sex: PRIMARY heterogeneity analysis ─────────────────────────────
+# Run cf_aipw on sex-stratified subsets. Sex is pre-treatment → valid z-TE.
+set.seed(42)
+zte_female <- cf_aipw(dat_main[Z_sex == 0], X, Y, Z, K = 5)
+
+set.seed(42)
+zte_male   <- cf_aipw(dat_main[Z_sex == 1], X, Y, Z, K = 5)
+
+# Test of effect modification (Wald test, strata independent)
+diff_sex    <- zte_female$ate - zte_male$ate
+se_diff_sex <- sqrt(zte_female$sd^2 + zte_male$sd^2)
+pval_sex    <- 2 * pnorm(-abs(diff_sex / se_diff_sex))
+
+cat(sprintf("z-TE(female): %.4f (SE=%.4f)\n", zte_female$ate, zte_female$sd))
+cat(sprintf("z-TE(male):   %.4f (SE=%.4f)\n", zte_male$ate,   zte_male$sd))
+cat(sprintf("Difference (F-M): %.4f (SE=%.4f, p=%.4f)\n",
+            diff_sex, se_diff_sex, pval_sex))
+cat(sprintf("n_female=%d, n_male=%d\n",
+            sum(dat_main$Z_sex == 0), sum(dat_main$Z_sex == 1)))
+```
+
+```{r zte-sex-plot, cache=FALSE, dependson="zte-sex"}
+# ── Forest plot: z-TE by sex ─────────────────────────────────────────────────
+sex_df <- rbind(
+  zte_row(dml_res,    "Overall ATE"),
+  zte_row(zte_female, "z-TE: Female"),
+  zte_row(zte_male,   "z-TE: Male")
+)
+sex_df$estimand <- factor(sex_df$estimand,
+  levels = rev(c("Overall ATE", "z-TE: Female", "z-TE: Male")))
+
+ggplot(sex_df, aes(x = est, y = estimand)) +
+  geom_point(size = 3.5, color = "#2C3E7A") +
+  geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0.25,
+                 color = "#2C3E7A", linewidth = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "firebrick") +
+  annotate("text", x = max(sex_df$hi) * 0.5, y = 0.6,
+           label = sprintf("Effect modification p = %.3f", pval_sex),
+           hjust = 0, size = 3.5, color = "gray30") +
+  labs(x = "Risk Difference", y = NULL,
+       title = "z-TE by Sex (CF-AIPW, 95% CI)") +
+  theme_bw(base_size = 12) + theme(panel.grid.minor = element_blank())
+```
+
+## 4B — z-TE by Admission Type (SECONDARY)
+
+```{r zte-adm, cache=TRUE, dependson="load-data"}
+# ── z-TE by admission type: SECONDARY (expect null result) ──────────────────
+set.seed(42)
+zte_med  <- cf_aipw(dat_main[adm_type == "medical"],  X, Y, Z, K = 5)
+
+set.seed(42)
+zte_surg <- cf_aipw(dat_main[adm_type == "surgical"], X, Y, Z, K = 5)
+
+diff_adm    <- zte_med$ate - zte_surg$ate
+se_diff_adm <- sqrt(zte_med$sd^2 + zte_surg$sd^2)
+pval_adm    <- 2 * pnorm(-abs(diff_adm / se_diff_adm))
+
+cat(sprintf("z-TE(medical):  %.4f (SE=%.4f)\n", zte_med$ate,  zte_med$sd))
+cat(sprintf("z-TE(surgical): %.4f (SE=%.4f)\n", zte_surg$ate, zte_surg$sd))
+cat(sprintf("Difference: %.4f (SE=%.4f, p=%.4f)\n", diff_adm, se_diff_adm, pval_adm))
+```
+
+```{r zte-adm-plot, cache=FALSE, dependson=c("zte-adm","dml")}
+# ── Forest plot: z-TE by admission type ──────────────────────────────────────
+adm_df <- rbind(
+  zte_row(dml_res,  "Overall ATE"),
+  zte_row(zte_med,  "z-TE: Medical"),
+  zte_row(zte_surg, "z-TE: Surgical")
+)
+adm_df$estimand <- factor(adm_df$estimand,
+  levels = rev(c("Overall ATE", "z-TE: Medical", "z-TE: Surgical")))
+
+ggplot(adm_df, aes(x = est, y = estimand)) +
+  geom_point(size = 3.5, color = "#2C3E7A") +
+  geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0.25,
+                 color = "#2C3E7A", linewidth = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "firebrick") +
+  annotate("text", x = max(adm_df$hi) * 0.5, y = 0.6,
+           label = sprintf("Effect modification p = %.3f", pval_adm),
+           hjust = 0, size = 3.5, color = "gray30") +
+  labs(x = "Risk Difference", y = NULL,
+       title = "z-TE by Admission Type (CF-AIPW, 95% CI)") +
+  theme_bw(base_size = 12) + theme(panel.grid.minor = element_blank())
+```
+
+## 4C — Causal Forest (Exploratory)
+
+The causal forest provides a nonparametric view of treatment effect heterogeneity. These results are exploratory and complement the stratified CF-AIPW estimates in Sections 4A--4B.
+
+```{r causal-forest, cache=TRUE, dependson="load-data"}
+# ── Causal forest ────────────────────────────────────────────────────────────
+set.seed(42)
+cf_covs <- c("Z_age", "Z_sex", "Z_charlson", "adm_type_num")
+
+crf <- causal_forest(
+  X         = as.matrix(dat_main[, cf_covs, with = FALSE]),
+  Y         = as.numeric(dat_main$Y_death),
+  W         = as.numeric(dat_main$X_bmi),
+  num.trees = 2000,
+  seed      = 42
+)
+
+dat_main[, cate := as.numeric(crf$predictions)]
+cat(sprintf("Causal forest mean CATE: %.4f (DML ATE: %.4f)\n",
+            mean(dat_main$cate), dml_res$ate))
+```
+
+```{r assign-cate, cache=FALSE, include=FALSE, dependson="causal-forest"}
+# data.table := invisible to knitr cache — re-assign on every render
+dat_main[, cate := as.numeric(crf$predictions)]
+```
+
+```{r test-calibration, cache=TRUE, dependson="causal-forest"}
+# ── Omnibus test for heterogeneity ───────────────────────────────────────────
+tc <- test_calibration(crf)
+print(tc)
+```
+
+```{r blp, cache=TRUE, dependson="causal-forest"}
+# ── Best Linear Projection: which covariates drive heterogeneity? ────────────
+blp <- best_linear_projection(crf,
+  A = as.matrix(dat_main[, cf_covs, with = FALSE]))
+print(blp)
+```
+
+```{r decile-heterogeneity, cache=FALSE, dependson="causal-forest"}
+# ── Decile heterogeneity (vignette II pattern) ───────────────────────────────
+dat_main[, cate_dec := as.integer(cut(cate, breaks = quantile(cate, seq(0,1,0.1)),
+                                       include.lowest = TRUE))]
+dec_het <- dat_main[, .(
+  mean_cate = mean(cate),
+  se        = sd(cate) / sqrt(.N),
+  n         = .N
+), by = cate_dec][order(cate_dec)]
+
+ggplot(dec_het, aes(x = cate_dec, y = mean_cate)) +
+  geom_point(size = 2.5, color = "#2C3E7A") +
+  geom_line(color = "#2C3E7A") +
+  geom_errorbar(aes(ymin = mean_cate - 1.96*se, ymax = mean_cate + 1.96*se),
+                width = 0.3, color = "#2C3E7A") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "firebrick") +
+  labs(x = "CATE Decile", y = "Mean CATE (risk difference)",
+       title = "CATE by Decile (Causal Forest)") +
+  theme_bw(base_size = 12)
+```
+
+```{r cate-distribution, cache=FALSE, dependson="causal-forest"}
+# ── CATE distribution by sex ─────────────────────────────────────────────────
+ggplot(dat_main, aes(x = cate, fill = factor(Z_sex))) +
+  geom_histogram(bins = 50, alpha = 0.6, position = "identity") +
+  scale_fill_manual(values = c("#E86B2E","#4C8EC8"),
+                    labels = c("Female","Male")) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(x = "CATE (risk difference)", y = "Count", fill = NULL,
+       title = "CATE Distribution by Sex") +
+  theme_bw(base_size = 12) + theme(legend.position = "bottom")
+```
+
+## 4D — ETT (Exploratory)
+
+The ETT is derived from causal forest CATEs and should be interpreted as exploratory. The inferential z-TE results in Sections 4A--4B are the primary heterogeneity findings.
+
+```{r ett, cache=FALSE, dependson="causal-forest"}
+# ── ETT = E[Y(1)-Y(0) | X=1] via causal forest CATEs ───────────────────────
+ett <- mean(dat_main$cate[dat_main$X_bmi == 1])
+se_ett <- sd(dat_main$cate[dat_main$X_bmi == 1]) /
+          sqrt(sum(dat_main$X_bmi == 1))
+
+cat(sprintf("ETT (obese):     %.4f (SE=%.4f, n=%d)\n",
+            ett, se_ett, sum(dat_main$X_bmi == 1)))
+cat(sprintf("ETN (non-obese): %.4f (SE=%.4f, n=%d)\n",
+            mean(dat_main$cate[dat_main$X_bmi == 0]),
+            sd(dat_main$cate[dat_main$X_bmi == 0]) / sqrt(sum(dat_main$X_bmi == 0)),
+            sum(dat_main$X_bmi == 0)))
+
+# ETT by sex
+ett_sex <- dat_main[, .(
+  ett = mean(cate),
+  se  = sd(cate) / sqrt(.N),
+  n   = .N
+), by = .(X_bmi, Z_sex)]
+ett_sex[, group := ifelse(X_bmi == 1, "Obese", "Non-obese")]
+ett_sex[, sex   := ifelse(Z_sex == 1, "Male", "Female")]
+kable(ett_sex[, .(sex, group, n, est = round(ett, 4), SE = round(se, 4))],
+      caption = "ETT/ETN by Sex (causal forest CATEs)") |>
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+# Section 5 — Sensitivity Analysis
+
+Causal conclusions rest on untestable assumptions. We assess robustness to unmeasured confounding via E-values and to the treatment definition via a BMI > 30 threshold sensitivity check.
+
+## 5A — E-Values
+
+```{r evalues, cache=TRUE, dependson=c("dml","zte-sex","zte-adm")}
+# ── E-values for all primary estimates ───────────────────────────────────────
+p0 <- mean(dat_main$Y_death[dat_main$X_bmi == 0])
+cat(sprintf("Baseline mortality (non-obese): %.3f\n", p0))
+
+# Helper: compute E-value for an estimate with CI
+compute_evalue <- function(ate, ci_lo, ci_hi, p0) {
+  rr_est <- rd_to_rr(ate, p0)
+  # CI bound closer to null: upper if protective (ate<0), lower if harmful
+  ci_near_null <- ifelse(ate < 0, ci_hi, ci_lo)
+  rr_ci <- rd_to_rr(ci_near_null, p0)
+  c(evalue_est = evalue_fn(rr_est), evalue_ci = evalue_fn(rr_ci))
+}
+
+# Overall
+ev_overall <- compute_evalue(dml_res$ate, dml_ci[1], dml_ci[2], p0)
+cat(sprintf("\nOverall ATE: RD=%.4f, E-value=%.2f, E-value(CI)=%.2f\n",
+            dml_res$ate, ev_overall[1], ev_overall[2]))
+
+# z-TE(female)
+p0_f <- mean(dat_main$Y_death[dat_main$X_bmi == 0 & dat_main$Z_sex == 0])
+ev_f <- compute_evalue(zte_female$ate,
+          zte_female$ate - 1.96*zte_female$sd,
+          zte_female$ate + 1.96*zte_female$sd, p0_f)
+cat(sprintf("z-TE(female): RD=%.4f, E-value=%.2f, E-value(CI)=%.2f\n",
+            zte_female$ate, ev_f[1], ev_f[2]))
+
+# z-TE(male)
+p0_m <- mean(dat_main$Y_death[dat_main$X_bmi == 0 & dat_main$Z_sex == 1])
+ev_m <- compute_evalue(zte_male$ate,
+          zte_male$ate - 1.96*zte_male$sd,
+          zte_male$ate + 1.96*zte_male$sd, p0_m)
+cat(sprintf("z-TE(male):   RD=%.4f, E-value=%.2f, E-value(CI)=%.2f\n",
+            zte_male$ate, ev_m[1], ev_m[2]))
+
+# z-TE(medical)
+p0_med <- mean(dat_main$Y_death[dat_main$X_bmi == 0 & dat_main$adm_type == "medical"])
+ev_med <- compute_evalue(zte_med$ate,
+           zte_med$ate - 1.96*zte_med$sd,
+           zte_med$ate + 1.96*zte_med$sd, p0_med)
+cat(sprintf("z-TE(medical):  RD=%.4f, E-value=%.2f, E-value(CI)=%.2f\n",
+            zte_med$ate, ev_med[1], ev_med[2]))
+
+# z-TE(surgical)
+p0_surg <- mean(dat_main$Y_death[dat_main$X_bmi == 0 & dat_main$adm_type == "surgical"])
+ev_surg <- compute_evalue(zte_surg$ate,
+            zte_surg$ate - 1.96*zte_surg$sd,
+            zte_surg$ate + 1.96*zte_surg$sd, p0_surg)
+cat(sprintf("z-TE(surgical): RD=%.4f, E-value=%.2f, E-value(CI)=%.2f\n",
+            zte_surg$ate, ev_surg[1], ev_surg[2]))
+```
+
+## 5B — BMI Threshold Sensitivity (BMI > 30)
+
+```{r bmi30-sensitivity, cache=TRUE, cache.extra=file.info("C:/Users/allen/Desktop/Stats C160/miiv/admissions.fst")$mtime}
+# ── Sensitivity: redefine treatment as BMI > 30 instead of BMI > 25 ──────────
+# Reload raw BMI data and recut at 30
+bmi_30 <- omr[result_name %in% c("BMI (kg/m2)", "BMI")]
+bmi_30[, bmi := suppressWarnings(as.numeric(result_value))]
+bmi_30 <- bmi_30[!is.na(bmi) & bmi > 10 & bmi < 80]
+setorder(bmi_30, subject_id, -chartdate)
+bmi_30 <- bmi_30[, .SD[1], by = subject_id][, .(subject_id, bmi)]
+bmi_30 <- bmi_30[bmi > 18.5 & bmi < 45]  # wider range for BMI>30 analysis
+bmi_30[, X_bmi := as.integer(bmi > 30)]
+
+# Rebuild dataset with BMI>30 threshold
+dat_30 <- merge(bmi_30[, .(subject_id, X_bmi)],
+                icu_first[, .(subject_id, hadm_id)], by = "subject_id")
+dat_30 <- merge(dat_30, pat, by = "subject_id")
+dat_30 <- merge(dat_30, mort_dat[, .(subject_id, Y_death, adm_type)], by = "subject_id")
+dat_30 <- merge(dat_30, charlson_dat, by = "subject_id", all.x = TRUE)
+dat_30[is.na(Z_charlson), Z_charlson := 0]
+dat_30[, adm_type := factor(adm_type, levels = c("medical", "surgical", "other"))]
+dat_30 <- dat_30[adm_type %in% c("medical", "surgical")]
+dat_30[, adm_type := droplevels(adm_type)]
+dat_30[, hadm_id := NULL]
+
+cat(sprintf("BMI>30 cohort: N=%d, obese(BMI>30)=%d (%.1f%%)\n",
+            nrow(dat_30), sum(dat_30$X_bmi), 100*mean(dat_30$X_bmi)))
+
+# DML on BMI>30 cohort
+set.seed(42)
+dml_30 <- cf_aipw(dat_30, X, Y, Z, K = 5)
+dml_30_ci <- c(dml_30$ate - 1.96*dml_30$sd, dml_30$ate + 1.96*dml_30$sd)
+cat(sprintf("DML ATE (BMI>30): %.4f [%.4f, %.4f]\n",
+            dml_30$ate, dml_30_ci[1], dml_30_ci[2]))
+
+# z-TE by sex at BMI>30
+set.seed(42)
+zte_f_30 <- cf_aipw(dat_30[Z_sex == 0], X, Y, Z, K = 5)
+set.seed(42)
+zte_m_30 <- cf_aipw(dat_30[Z_sex == 1], X, Y, Z, K = 5)
+
+cat(sprintf("z-TE(female, BMI>30): %.4f (SE=%.4f)\n", zte_f_30$ate, zte_f_30$sd))
+cat(sprintf("z-TE(male, BMI>30):   %.4f (SE=%.4f)\n", zte_m_30$ate, zte_m_30$sd))
+diff_sex_30 <- zte_f_30$ate - zte_m_30$ate
+se_sex_30   <- sqrt(zte_f_30$sd^2 + zte_m_30$sd^2)
+cat(sprintf("Difference: %.4f (p=%.4f)\n", diff_sex_30,
+            2*pnorm(-abs(diff_sex_30/se_sex_30))))
+
+# Compare thresholds
+cat("\n── Threshold comparison ──────────────────\n")
+cat(sprintf("BMI>25: ATE=%.4f, z-TE(F)=%.4f, z-TE(M)=%.4f\n",
+            dml_res$ate, zte_female$ate, zte_male$ate))
+cat(sprintf("BMI>30: ATE=%.4f, z-TE(F)=%.4f, z-TE(M)=%.4f\n",
+            dml_30$ate, zte_f_30$ate, zte_m_30$ate))
+```
+
+# Section 6 — Results Summary and Discussion
+
+```{r results-table, cache=FALSE, dependson=c("dml","zte-sex","zte-adm","evalues")}
+# ── Final results table ──────────────────────────────────────────────────────
+results <- rbind(
+  zte_row(dml_res,    "Overall ATE (DML)"),
+  zte_row(zte_female, "z-TE: Female"),
+  zte_row(zte_male,   "z-TE: Male"),
+  data.frame(estimand = "Diff (Female - Male)", est = diff_sex,
+             se = se_diff_sex,
+             lo = diff_sex - 1.96*se_diff_sex,
+             hi = diff_sex + 1.96*se_diff_sex,
+             pval = pval_sex, stringsAsFactors = FALSE),
+  zte_row(zte_med,    "z-TE: Medical"),
+  zte_row(zte_surg,   "z-TE: Surgical"),
+  data.frame(estimand = "Diff (Medical - Surgical)", est = diff_adm,
+             se = se_diff_adm,
+             lo = diff_adm - 1.96*se_diff_adm,
+             hi = diff_adm + 1.96*se_diff_adm,
+             pval = pval_adm, stringsAsFactors = FALSE)
+)
+
+kable(results[, c("estimand","est","se","lo","hi","pval")],
+      digits    = c(0, 4, 4, 4, 4, 4),
+      col.names = c("Estimand","Estimate","SE","95% CI Low","95% CI High","p-value"),
+      caption   = "Primary causal estimates (risk differences, DML/CF-AIPW)") |>
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE) |>
+  row_spec(which(results$estimand == "Diff (Female - Male)"),
+           bold = TRUE, background = "#FFF9C4") |>
+  row_spec(which(results$estimand == "Diff (Medical - Surgical)"),
+           bold = TRUE, background = "#E8F5E9")
+```
+
+## Discussion
+
+**Primary finding: sex-based heterogeneity.** The stratified CF-AIPW analysis suggests that the obesity paradox appears to be concentrated among female ICU patients, with a statistically significant protective effect observed in females but not in males. For female ICU patients, the z-TE is negative (obesity is protective), while the male z-TE is near zero. This sex difference is statistically significant and robust across the BMI > 25 and BMI > 30 thresholds. Biological plausibility includes estrogen-mediated anti-inflammatory effects, differences in fat distribution (subcutaneous vs. visceral), and sex-specific immune responses during critical illness. Importantly, the overall ATE is small and not statistically significant, suggesting that the obesity paradox does not hold uniformly across the population. This pattern is further supported by the causal forest, which identifies sex as a significant contributor to treatment effect heterogeneity. However, the modest E-values indicate that these findings may be sensitive to unmeasured confounding.
+
+**Secondary finding: admission type is null.** The z-TE estimates for medical and surgical admissions are nearly identical, with effect modification p-values close to 1. There is no evidence that the obesity paradox varies by admission route in this cohort.
+
+**Limitations:**
+
+1. *Charlson proxy:* ricu may return ICD-code counts rather than a validated Charlson comorbidity index, potentially attenuating adjustment quality.
+2. *BMI measurement timing:* the OMR table records outpatient BMI, not ICU-day weight, introducing possible misclassification.
+3. *SOFA unavailable:* severity scores were zero for all patients in this extraction, precluding severity-based subgroup analysis.
+4. *Unmeasured confounding:* E-values quantify the minimum confounder strength needed to explain away each estimate.
+5. *Multiple comparisons:* sex and admission type analyses are pre-specified but not adjusted for multiplicity.
+6. *BMI--admission type exclusion:* we assume obesity does not cause admission type; this is most defensible in MIMIC-IV's predominantly emergency cohort.
+7. *Causal forest SEs:* sd(CATE)/sqrt(n) understates the true standard error; the AIPW-based z-TEs in Sections 4A--4B are the valid inferential results.
+
+```{r session-info, cache=FALSE}
+sessionInfo()
+```
