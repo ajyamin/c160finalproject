@@ -29,7 +29,7 @@ library(knitr)
 library(kableExtra)
 
 # ── Global settings ──────────────────────────────────────────────────────────
-Sys.setenv(RICU_DATA_PATH = "C:/Users/allen/Desktop/Stats C160")
+Sys.setenv(RICU_DATA_PATH = Sys.getenv("RICU_DATA_PATH")
 attach_src("miiv", assign_env = .GlobalEnv)
 set.seed(42)
 knitr::opts_chunk$set(
