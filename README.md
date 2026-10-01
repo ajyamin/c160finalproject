@@ -99,13 +99,10 @@ Causal inference · Double machine learning · AIPW · IPW · Logistic regressio
 **Data:**  
 MIMIC-IV electronic health records
 
-## Repository
+## Project Files
 
-The primary analysis is contained in:
-
-`c160_analysis1.Rmd`
-
-The R Markdown file contains the data preparation, causal models, estimation procedures, sensitivity analyses, visualizations, and results used in the final report.
+- [`c160_analysis1.Rmd`](c160_analysis1.Rmd) — Full R analysis, including data preparation, causal estimation, machine learning models, sensitivity analyses, and visualizations.
+- [`Obesity_Paradox_ICU_Report.pdf`](Obesity_Paradox_ICU_Report.pdf) — Final research report describing the causal question, methodology, results, assumptions, and limitations.
 
 ---
 
